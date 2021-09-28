@@ -2208,6 +2208,13 @@ typedef struct malloc_chunk *mbinptr;
     requests via mmap.
 */
 
+/*
+ * 以上的32bins of size 64, 指的是从1024（下标64）开始，下标64和65间距64，下标65和下标66坚决64
+ * 一直到下标96和下标97间距64，注意下标96依旧属于32bins
+ * 即96 - 64 + 1 == 33个bins是属于32bins的。
+ *
+ */
+
 #define NBINS             128
 #define NSMALLBINS         64
 #define SMALLBIN_WIDTH    MALLOC_ALIGNMENT
@@ -2230,6 +2237,19 @@ typedef struct malloc_chunk *mbinptr;
 // XXX It remains to be seen whether it is good to keep the widths of
 // XXX the buckets the same or whether it should be scaled by a factor
 // XXX of two as well.
+
+// 前置：largebin从1024开始，即下标64为 1024 -- 1087，前32个的最大size，
+// 即第95个，size范围为：3008 -- 3071 【3008 == 1024 + 31 * 64，等差数列】
+// 当size为3072时，已经不再属于前32个large bin了
+// 3072对应的：3072 / 64 == 48
+    // 即当请求的sz不超过3072时，我们一下就可以找到，它是在前32个bin里，
+    // 为什么要加48：
+    // 设当前size为sz，由等差数列知，sz = a1 + (n - 1)* d, 其中a1 == 1024,
+    // n是当前sz所处的位置减去63（smallbin & unsorted bin）
+    // 整理得：n = x / 64 - 15
+    // 数组中的序号为 n = x / 64 - 15 + 63 == x / 64 + 48
+// 当超过3073时，除以64，一定也超过了48，此时直接计算除以9的，同理等差数列推下标
+
 #define largebin_index_64(sz)                                                \
 (((((unsigned long)(sz)) >>  6) <= 48)?  48 + (((unsigned long)(sz)) >>  6): \
  ((((unsigned long)(sz)) >>  9) <= 20)?  91 + (((unsigned long)(sz)) >>  9): \
@@ -3100,8 +3120,9 @@ static Void_t *sYSMALLOc(nb, av)INTERNAL_SIZE_T nb; mstate av;
         /*
             由于 nb 为所需 chunk 的大小，在_int_malloc()函数中已经将用户需要分配的大小转化为
             chunk 大小，当如果这个 chunk 直接使用 mmap()分配的话，该 chunk 不存在下一个相邻的
-            chunk，也就没有 prev_size 的内存空间可以复用，所以还需要额外 SIZE_SZ 大小的内存。由
-            于 mmap()分配的内存块必须页对齐。如果使用 mmap()分配内存，需要重新计算分配的内存大小 size。
+            chunk，也就没有 prev_size 的内存空间可以复用，所以还需要额外 SIZE_SZ 大小的内存。
+            这块内存充当next chunk的prev_size字段，来给当前的chunk复用。
+            由于 mmap()分配的内存块必须页对齐。如果使用 mmap()分配内存，需要重新计算分配的内存大小 size。
          */
 
         size = (nb + SIZE_SZ + pagemask) & ~pagemask;
@@ -3119,6 +3140,7 @@ static Void_t *sYSMALLOc(nb, av)INTERNAL_SIZE_T nb; mstate av;
                 齐的，也一定是按照 2*SIZE_SZ 对齐的，满足 chunk 的边界对齐规则，使用 chunk2mem()获
                 取 chunk 中实际可用的内存也没有问题，所以这里不需要做额外的对齐操作。
          */
+        // 这里取不到等号，因为size在刚才增加了size_sz
         if ((unsigned long) (size) > (unsigned long) (nb)) {
 
             mm = (char *) (MMAP(0, size, PROT_READ | PROT_WRITE, MAP_PRIVATE));
@@ -3203,6 +3225,7 @@ static Void_t *sYSMALLOc(nb, av)INTERNAL_SIZE_T nb; mstate av;
             prev_inuse(old_top) &&
             ((unsigned long) old_end & pagemask) == 0));
 
+    // 以下两点是因为我们防止：明明能从原有的条件直接分配，而又来本函数寻求新的size
     /* Precondition: not enough current space to satisfy nb request */
     assert((unsigned long) (old_size) < (unsigned long) (nb + MINSIZE));
 
@@ -3222,15 +3245,19 @@ static Void_t *sYSMALLOc(nb, av)INTERNAL_SIZE_T nb; mstate av;
         old_heap_size = old_heap->size;
         if ((long) (MINSIZE +nb - old_size) > 0
                                               && grow_heap(old_heap, MINSIZE +nb - old_size) == 0) {
+            /*如果fencepost + nb 超出了old_size, 这条实际上总是判断成功的，因为前面有assert*/
+            /* 同时我们调用grow函数扩展heap也成功了 */
+            /* 此时old_heap->size已经更新了, 更新为增加了用户需求和MINSIZE之和 */
             av->system_mem += old_heap->size - old_heap_size;
             arena_mem += old_heap->size - old_heap_size;
 #if 0
             if(mmapped_mem + arena_mem + sbrked_mem > max_total_mem)
               max_total_mem = mmapped_mem + arena_mem + sbrked_mem;
 #endif
+            /* 此时top_chunk的size也已经更新了，增加的也是nb + MINSIZE */
             set_head(old_top, (((char *) old_heap + old_heap->size) - (char *) old_top)
                               | PREV_INUSE);
-        }
+        }// 直接grow原heap不行，我们去创建一个新的heap
         else if ((heap = new_heap(nb + (MINSIZE +sizeof(*heap)), mp_.top_pad))) {
             /* Use a newly allocated heap.  */
             heap->ar_ptr = av;
@@ -3265,6 +3292,16 @@ static Void_t *sYSMALLOc(nb, av)INTERNAL_SIZE_T nb; mstate av;
                 这样做完全是要遵循不能有两个空闲 chunk 相邻的约定。
                 如果原 top chunk 中有效空间不足 MINSIZE，则将整个原 top chunk 作为 fencepost，并设
                 置 fencepost 的第一个 chunk 的相关状态。
+             */
+
+            /*
+             * 注意到top_chunk 只存在于non_main_arena的最尾部，即两个关键点，non_main_arena,以及属于该arena
+             * 的最后一个heap，这个heap的最靠后位置
+             * fencepost的出现位置：只出现在non_main_arena管辖的每两个heap之间，存在于这每两个heap的较前一个heap
+             * 目的是将前一个heap和当前heap划分开来。
+             * 所以grow_heap 不需要设置fencepost，因为grow的是top chunk,而top chunk后面根本就没有fencepost
+             * 所以new_heap需要设置fencepost,设置的是前一个heap的末尾
+             * 这样前一个heap避免了向后面合并时，访问不存在的内存的区域。
              */
 
 
@@ -3492,7 +3529,7 @@ static Void_t *sYSMALLOc(nb, av)INTERNAL_SIZE_T nb; mstate av;
                         (*__after_morecore_hook)();
                 }
 
-                    /* handle non-contiguous cases */
+                /* handle non-contiguous cases */
                 else {
                     /* MORECORE/mmap must correctly align */
                     assert(((unsigned long) chunk2mem(brk) & MALLOC_ALIGN_MASK) == 0);
@@ -3674,6 +3711,8 @@ munmap_chunk(p)mchunkptr p;
     uintptr_t block = (uintptr_t) p - p->prev_size;
 
     // ？？？ 为什么要加上一个 prev_size
+    //由于使用 mmap()分配的 chunk 的 prev_size 中记录的前一
+    //个相邻空闲 chunk 的大小，mmap()分配的内存是页对齐的，所以一般情况下 prev_size 为 0。
     size_t total_size = p->prev_size + size;
     /* Unfortunately we have to do the compilers job by hand here.  Normally
        we would test BLOCK and TOTAL-SIZE separately for compliance with the
